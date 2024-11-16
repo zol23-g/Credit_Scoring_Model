@@ -1,81 +1,83 @@
 from flask import Flask, request, jsonify
 import pickle
 import pandas as pd
-import numpy as np
+from datetime import datetime
+from flask_cors import CORS
 
-# Initialize Flask app
 app = Flask(__name__)
+CORS(app)
 
-# Load the trained models
+# Load the trained Logistic Regression model
 with open('models/log_reg_model.pkl', 'rb') as f:
     log_reg_model = pickle.load(f)
 
-with open('models/rf_model.pkl', 'rb') as f:
-    rf_model = pickle.load(f)
-
-with open('models/gbm_model.pkl', 'rb') as f:
-    gbm_model = pickle.load(f)
-
-
-# Sample input for testing
-def create_input_df(data):
+def calculate_rfms(transactions):
     """
-    Convert the JSON input into a pandas DataFrame for model prediction.
+    Calculate Recency, Frequency, Monetary, and Size based on multiple transaction data.
     """
-    input_df = pd.DataFrame([data], columns=['Recency', 'Frequency', 'Monetary', 'Size'])
-    return input_df
+    df = pd.DataFrame(transactions)
+    df['TransactionDate'] = pd.to_datetime(df['TransactionDate'])
 
+    # Convert 'Amount' to numeric, coercing errors to NaN
+    df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce')
 
-# Root endpoint
-@app.route('/')
-def home():
-    return "Credit Scoring Prediction API is up and running!"
+    # Drop rows where 'Amount' could not be converted to a number
+    df = df.dropna(subset=['Amount'])
 
-# Logistic Regression Prediction Endpoint
-@app.route('/predict/logistic_regression', methods=['POST'])
-def predict_log_reg():
+    # Check if there are any rows left after dropping NaN values
+    if df.empty:
+        raise ValueError("No valid transaction data available after processing. Check 'Amount' values.")
+
+    # Calculate RFMS features for each customer
+    recency = df.groupby('CustomerId')['TransactionDate'].max().apply(lambda x: (datetime.now() - x).days)
+    frequency = df.groupby('CustomerId')['TransactionId'].count()
+    monetary = df.groupby('CustomerId')['Amount'].sum()
+    size = df.groupby('CustomerId')['Amount'].mean()
+
+    rfms_df = pd.DataFrame({
+        'Recency': recency,
+        'Frequency': frequency,
+        'Monetary': monetary,
+        'Size': size
+    }).reset_index()
+
+    return rfms_df
+
+@app.route('/predict', methods=['POST'])
+def predict():
     data = request.get_json(force=True)
-    input_df = create_input_df(data)
     
-    # Make predictions
-    prediction = log_reg_model.predict(input_df)
-    probability = log_reg_model.predict_proba(input_df)[:, 1]
+    # Ensure data is in the expected format (list of transactions)
+    if not isinstance(data, list):
+        return jsonify({'error': 'Input data must be a list of transactions'}), 400
     
-    return jsonify({
-        'model': 'Logistic Regression',
-        'prediction': int(prediction[0]),  # 0 for bad, 1 for good
-        'probability': float(probability[0])  # Probability of being good
-    })
+    try:
+        # Calculate RFMS features for all customers
+        rfms_df = calculate_rfms(data)
 
-# Random Forest Prediction Endpoint
-@app.route('/predict/random_forest', methods=['POST'])
-def predict_rf():
-    data = request.get_json(force=True)
-    input_df = create_input_df(data)
-    
-    prediction = rf_model.predict(input_df)
-    probability = rf_model.predict_proba(input_df)[:, 1]
-    
-    return jsonify({
-        'model': 'Random Forest',
-        'prediction': int(prediction[0]),
-        'probability': float(probability[0])
-    })
+        # Prepare response for each customer
+        results = []
+        for _, row in rfms_df.iterrows():
+            input_df = row[['Recency', 'Frequency', 'Monetary', 'Size']].to_frame().T
+            prediction = log_reg_model.predict(input_df)[0]
+            probability = log_reg_model.predict_proba(input_df)[0, 1]
 
-# Gradient Boosting Prediction Endpoint
-@app.route('/predict/gradient_boosting', methods=['POST'])
-def predict_gbm():
-    data = request.get_json(force=True)
-    input_df = create_input_df(data)
-    
-    prediction = gbm_model.predict(input_df)
-    probability = gbm_model.predict_proba(input_df)[:, 1]
-    
-    return jsonify({
-        'model': 'Gradient Boosting',
-        'prediction': int(prediction[0]),
-        'probability': float(probability[0])
-    })
+            results.append({
+                'CustomerId': row['CustomerId'],
+                'calculated_rfms': {
+                    'Recency': row['Recency'],
+                    'Frequency': row['Frequency'],
+                    'Monetary': row['Monetary'],
+                    'Size': row['Size']
+                },
+                'prediction': int(prediction),  # 0 for bad, 1 for good
+                'probability': float(probability)
+            })
+        
+        return jsonify(results)
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    app.run(debug=True)
